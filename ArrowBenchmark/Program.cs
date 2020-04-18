@@ -283,14 +283,10 @@ namespace ArrowBenchmark
             //return selectMask.Count(v => v == -1);
         }
 
-        //[Benchmark]
-        public void FilterLandRegistryRecordsArrowVectorized2()
+        [Benchmark]
+        public int FilterLandRegistryRecordsArrowVectorized2()
         {
-            //Console.WriteLine("IsHardwareAccelerated: {0} ({1})", Vector.IsHardwareAccelerated, Vector<int>.One);
-            //var greaterVector = Vector.GreaterThanOrEqual(Vector<int>.One, Vector<int>.Zero);
-            //Console.WriteLine("greaterVector: {0}", greaterVector);
-
-            var recordCount = recordBatch.Length;
+            //var recordCount = recordBatch.Length;
             //var selectMask = new byte[recordCount]; // new int[0];
             const long MillisecondsPerDay = 86400000;
             var dateFilter = (int)(DateTimeOffset.Parse("2019-01-01").ToUnixTimeMilliseconds() / MillisecondsPerDay);
@@ -301,30 +297,31 @@ namespace ArrowBenchmark
             var priceValues = (recordBatch.Column(1) as FloatArray).Values;
             int[] selectMask2 = VectorizedFiltering.GetFilterMask<float, int>(
                 priceValues, Vector.GreaterThan, (v, f) => v > f, 5000000);
-            selectMask = VectorizedFiltering.CombineFilterMask(selectMask, selectMask2);
+            selectMask = VectorizedFiltering.CombineFilterMask(
+                selectMask, selectMask2, Vector.BitwiseAnd, (f1, f2) => f1 & f2);
 
-            //var stringEncoding = Encoding.ASCII;
-            //var propertyTypeVector = Vector<byte>.Zero;
-            //var propertyTypeFilter = new string[] { "D", "S", "T" }.Select(x => stringEncoding.GetBytes(x)[0]).ToArray();
-            //var propertyTypeValues = (recordBatch.Column(2) as StringArray).Values;
-            //for (var i = 0; i < recordCount; i++)
-            //{
-            //    selectMask[i] = selectMask[i] && propertyTypeFilter.Contains(propertyTypeValues[i]);
-            //}
+            byte[] byteSelectMask = VectorizedFiltering.NarrowFilterMask(selectMask);
+            var stringEncoding = Encoding.ASCII;
+            var propertyTypeFilter = new string[] { "D", "S", "T" }.Select(x => stringEncoding.GetBytes(x)[0]).ToArray();
+            var propertyTypeValues = (recordBatch.Column(2) as StringArray).Values;
+            byte[] byteSelectMask2 = VectorizedFiltering.GetFilterMask<byte>(
+                propertyTypeValues, Vector.Equals, (v, f) => v == f, propertyTypeFilter);
+            byteSelectMask = VectorizedFiltering.CombineFilterMask(
+                byteSelectMask, byteSelectMask2, Vector.BitwiseAnd, (f1, f2) => (byte)(f1 & f2));
 
-            //var tenureVector = Vector<byte>.Zero;
-            //var tenureFilter = stringEncoding.GetBytes("F")[0];
-            //var tenureValues = (recordBatch.Column(3) as StringArray).Values;
-            //for (var i = 0; i < recordCount; i++)
-            //{
-            //    selectMask[i] = selectMask[i] && tenureValues[i] == tenureFilter;
-            //}
+            var tenureFilter = stringEncoding.GetBytes("F")[0];
+            var tenureValues = (recordBatch.Column(3) as StringArray).Values;
+            byteSelectMask2 = VectorizedFiltering.GetFilterMask<byte, byte>(
+                tenureValues, Vector.Equals, (v, f) => v == f, tenureFilter);
+            byteSelectMask = VectorizedFiltering.CombineFilterMask(
+                byteSelectMask, byteSelectMask2, Vector.BitwiseAnd, (f1, f2) => (byte)(f1 & f2));
 
-            var count = VectorizedFiltering.CountFilterMask(selectMask);
+            var count = VectorizedFiltering.CountFilterMask(byteSelectMask);
 
 #if LOG
             Console.WriteLine("Found {0} records", count);
 #endif
+            return count;
         }
     }
 
@@ -332,75 +329,85 @@ namespace ArrowBenchmark
     {
         static void Main(string[] args)
         {
-            //int itemCount = new FilterBenchmark().BenchmarkSetup().FilterLandRegistryRecordsArrowVectorized();
+            //var filterBenchmark = new FilterBenchmark();
+            //filterBenchmark.BenchmarkSetup();
+            //int itemCount = filterBenchmark.FilterLandRegistryRecordsArrowVectorized2();
+
+            //Console.WriteLine("IsHardwareAccelerated: {0} ({1})", Vector.IsHardwareAccelerated, Vector<int>.One);
+            //var greaterVector = Vector.GreaterThanOrEqual(Vector<int>.One, Vector<int>.Zero);
+            //Console.WriteLine("greaterVector: {0}", greaterVector);
+
             // new DebugInProcessConfig()
             var summary = BenchmarkRunner.Run<FilterBenchmark>();
-
-            //// filtering function on apache arrow
-            //Console.WriteLine("Filtering land registry records arrow arrays");
-            //var arrowFilterTime = Stopwatch.StartNew();
-            //var filteredArrowCount = FilterLandRegistryRecordsArrow(recordBatch);
-            //arrowFilterTime.Stop();
-            //Console.WriteLine("Filtering arrow arrays took {0}ms", arrowFilterTime.ElapsedMilliseconds);
-            //Console.WriteLine("Found {0} records", filteredArrowCount);
-            //Console.WriteLine("----------------");
-
-            //// filtering function on apache arrow
-            //Console.WriteLine("Vectorized filtering land registry records arrow arrays");
-            //var vectorizedFilterTime = Stopwatch.StartNew();
-            //var filteredVectorizedCount = FilterLandRegistryRecordsArrowVectorized(recordBatch);
-            //vectorizedFilterTime.Stop();
-            //Console.WriteLine("Filtering arrow arrays took {0}ms", vectorizedFilterTime.ElapsedMilliseconds);
-            //Console.WriteLine("Found {0} records", filteredVectorizedCount);
-            //Console.WriteLine("----------------");
-
-            //Console.WriteLine("Vectorized v2 filtering land registry records arrow arrays");
-            //var vectorized2FilterTime = Stopwatch.StartNew();
-            //var filteredVectorized2Count = FilterLandRegistryRecordsArrowVectorized2(recordBatch);
-            //vectorizedFilterTime.Stop();
-            //Console.WriteLine("Filtering arrow arrays took {0}ms", vectorized2FilterTime.ElapsedMilliseconds);
-            //Console.WriteLine("Found {0} records", filteredVectorized2Count);
         }
     }
 
     public static class VectorizedFiltering
     {
-        public static int[] CombineFilterMask(int[] filterMask1, int[] filterMask2)
+        public static T[] CombineFilterMask<T>(
+            T[] filterMask1, T[] filterMask2, 
+            Func<Vector<T>, Vector<T>, Vector<T>> combineVectorOp,
+            Func<T, T, T> combineItemOp
+        ) where T: unmanaged
         {
-            var lastVectorLimit = filterMask1.Length - (filterMask1.Length % Vector<int>.Count);
-            for (var i = 0; i < lastVectorLimit; i += Vector<int>.Count)
+            int itemCount = filterMask1.Length;
+            int vectorSize = Vector<T>.Count;
+            var lastVectorIndex = itemCount - (itemCount % vectorSize);
+            for (var i = 0; i < lastVectorIndex; i += vectorSize)
             {
-                Vector.BitwiseAnd(
-                    new Vector<int>(filterMask1, i),
-                    new Vector<int>(filterMask2, i)
+                // Vector.BitwiseAnd
+                combineVectorOp(
+                    new Vector<T>(filterMask1, i),
+                    new Vector<T>(filterMask2, i)
                 ).CopyTo(filterMask1, i);
             }
-            for (var i = lastVectorLimit; i < filterMask1.Length; i++)
+            for (var i = lastVectorIndex; i < itemCount; i++)
             {
-                filterMask1[i] &= filterMask2[i];
+                //filterMask1[i] &= filterMask2[i];
+                filterMask1[i] = combineItemOp(filterMask1[i], filterMask2[i]);
             }
             return filterMask1;
         }
 
-        public static int CountFilterMask(int[] filterMask)
+        public static int CountFilterMask(byte[] filterMask)
         {
-            var lastVectorLimit = filterMask.Length - (filterMask.Length % Vector<int>.Count);
-            var countVector = Vector<int>.Zero;
-            for (var i = 0; i < lastVectorLimit; i += Vector<int>.Count)
+            var itemCount = filterMask.Length;
+            var vectorSize = Vector<byte>.Count;
+            var lastVectorLimit = itemCount - (itemCount % vectorSize);
+            var countVector = Vector<byte>.Zero;
+            for (var i = 0; i < lastVectorLimit; i += vectorSize)
             {
                 //TODO: use Avx2.HorizontalAdd()
-                countVector += new Vector<int>(filterMask, i) & Vector<int>.One;
+                countVector += new Vector<byte>(filterMask, i) & Vector<byte>.One;
             }
             var count = 0;
-            for (var i = 0; i < Vector<int>.Count; i++)
+            for (var i = 0; i < vectorSize; i++)
             {
                 count += countVector[i];
             }
-            for (var i = lastVectorLimit; i < filterMask.Length; i++)
+            for (var i = lastVectorLimit; i < itemCount; i++)
             {
                 count += filterMask[i] & 1;
             }
             return count;
+        }
+
+        public static byte[] GetFilterMask<T>(
+            ReadOnlySpan<T> values,
+            Func<Vector<T>, Vector<T>, Vector<byte>> vectorOp,
+            Func<T, T, bool> filterOp,
+            T[] filterValues
+        ) where T : struct
+        {
+            byte[] filterMask = GetFilterMask<T, byte>(values, vectorOp, filterOp, filterValues[0]);
+
+            for (var i = 1; i < filterValues.Length; i++)
+            {
+                byte[] filterMask2 = GetFilterMask<T, byte>(values, vectorOp, filterOp, filterValues[i]);
+                filterMask = VectorizedFiltering.CombineFilterMask(
+                    filterMask, filterMask2, Vector.BitwiseOr, (f1, f2) => (byte)(f1 | f2));
+            }
+            return filterMask;
         }
 
         public static M[] GetFilterMask<T, M>(
@@ -414,38 +421,25 @@ namespace ArrowBenchmark
             var filterMask = new M[recordCount];
             var lastVectorIndex = recordCount - (recordCount % Vector<T>.Count);
             var filterVector = new Vector<T>(filterValue);
-            for (int i = 0, j = 0; i < lastVectorIndex; i += Vector<M>.Count, j++)
+            for (int i = 0; i < lastVectorIndex; i += Vector<T>.Count)
             {
                 vectorOp(
                     new Vector<T>(values.Slice(i)),
                     filterVector
                 ).CopyTo(filterMask, i);
             }
-            var zeroValue = default(M);
-            var oneValue = default(M);
-            Unsafe.InitBlock(ref Unsafe.As<M, byte>(ref oneValue), 255, (uint)Unsafe.SizeOf<M>());
+            //var zeroValue = default(M);
+            //var oneValue = default(M);
+            //Unsafe.InitBlock(ref Unsafe.As<M, byte>(ref oneValue), 255, (uint)Unsafe.SizeOf<M>());
             for (var i = lastVectorIndex; i < recordCount; i++)
             {
-                filterMask[i] = filterOp(values[i], filterValue) ? oneValue : zeroValue;
+                var predicateResult = filterOp(values[i], filterValue);
+                filterMask[i] = Unsafe.As<bool, M>(ref predicateResult);
+                //filterMask[i] = filterOp(values[i], filterValue) ? oneValue : zeroValue;
             }
 
             return filterMask;
-
         }
-
-        //private unsafe static T SetBytes<T>(T value, byte byteValue) where T : unmanaged
-        //{
-        //    //fixed ()
-        //    {
-        //        T* pValue = &value;
-        //        var p = (byte*)pValue;
-        //        for (var i = 0; i < sizeof(T); i++)
-        //        {
-        //            p[i] = byteValue;
-        //        }
-        //    }
-        //    return value;
-        //}
 
         public static byte[] NarrowFilterMask(int[] filterMask)
         {
