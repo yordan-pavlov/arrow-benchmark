@@ -145,11 +145,6 @@ namespace ArrowBenchmark
         [Benchmark]
         public int FilterLandRegistryRecordsArrowVectorized()
         {
-            //Console.WriteLine("IsHardwareAccelerated: {0} ({1})", Vector.IsHardwareAccelerated, Vector<int>.One);
-
-            //var greaterVector = Vector.GreaterThanOrEqual(Vector<int>.One, Vector<int>.Zero);
-            //Console.WriteLine("greaterVector: {0}", greaterVector);
-
             var recordCount = recordBatch.Length;
             var selectMask = new int[recordCount]; // new int[0];
 
@@ -283,22 +278,186 @@ namespace ArrowBenchmark
             //return selectMask.Count(v => v == -1);
         }
 
+        // using AVX2 instructions directly requires compiling with unafe
+        [Benchmark]
+        public unsafe int FilterLandRegistryRecordsArrowVectorizedAvx()
+        {
+            var recordCount = recordBatch.Length;
+            var selectMask = new int[recordCount]; // new int[0];
+
+            const long MillisecondsPerDay = 86400000;
+
+            var dateFilter = (int)(DateTimeOffset.Parse("2019-01-01").ToUnixTimeMilliseconds() / MillisecondsPerDay);
+            var dateFilterVector = Vector256.Create(dateFilter);
+            var dateFilterVectorLimit = recordCount - (recordCount % Vector256<int>.Count);
+            var dateValues = (recordBatch.Column(0) as Date32Array).Values;
+            fixed (int* pDateValues = dateValues, pSelectMask = selectMask)
+            {
+                for (var i = 0; i < dateFilterVectorLimit; i += Vector256<int>.Count)
+                {
+                    
+                    var resultVector = Avx2.CompareGreaterThan(
+                        Avx2.LoadVector256(pDateValues + i),
+                        dateFilterVector
+                    );
+                    Avx2.Store(pSelectMask + i, resultVector);
+                }
+            }
+            for (var i = dateFilterVectorLimit; i < recordCount; i++)
+            {
+                var predicateResult = dateValues[i] >= dateFilter;
+                selectMask[i] = Unsafe.As<bool, int>(ref predicateResult);
+                //selectMask[i] = dateValues[i] >= dateFilter ? -1 : 0;
+            }
+
+            var priceFilterVector = Vector256.Create(5000000f).AsInt32();
+            var priceFilterVectorLimit = recordCount - (recordCount % Vector256<float>.Count);
+            var priceValues = (recordBatch.Column(1) as FloatArray).Values;
+            fixed (float* pPriceValues = priceValues)
+            fixed (int* pSelectMask = selectMask)
+            {
+                for (var i = 0; i < priceFilterVectorLimit; i += Vector256<float>.Count)
+                {
+                    var resultVector = Avx2.And(
+                        Avx2.LoadVector256(pSelectMask + i),
+                        Avx2.CompareGreaterThan(
+                            Avx2.LoadVector256(pPriceValues + i).AsInt32(),
+                            priceFilterVector
+                        )
+                    );
+                    Avx2.Store(pSelectMask + i, resultVector);
+                }
+            }
+            for (var i = priceFilterVectorLimit; i < recordCount; i++)
+            {
+                var predicateResult = priceValues[i] > 5000000;
+                selectMask[i] &= Unsafe.As<bool, int>(ref predicateResult);
+                //selectMask[i] = selectMask[i] && priceValues[i] > 5000000 ? -1 : 0;
+            }
+
+            byte[] byteSelectMask = VectorizedFiltering.NarrowFilterMask(selectMask);
+
+            var stringEncoding = Encoding.ASCII;
+            var propertyTypeSelectMask = new byte[byteSelectMask.Length];
+            var propertyTypeFilterList = new string[] { "D", "S", "T" }.Select(x => stringEncoding.GetBytes(x)[0]).ToArray();
+            var propertyTypeFilterVectorLimit = recordCount - (recordCount % Vector256<byte>.Count);
+            for (var j = 0; j < propertyTypeFilterList.Length; j++)
+            {
+                var propertyTypeFilter = propertyTypeFilterList[j];
+                var propertyTypeFilterVector = Vector256.Create(propertyTypeFilter).AsSByte();
+                var propertyTypeValues = (recordBatch.Column(2) as StringArray).Values;
+                fixed (byte* pPropertyTypeValues = propertyTypeValues, pPropertyTypeSelectMask = propertyTypeSelectMask)
+                {
+                    for (var i = 0; i < propertyTypeFilterVectorLimit; i += Vector256<byte>.Count)
+                    {
+                        var resultVector = Avx2.And(
+                            Avx2.LoadVector256(pPropertyTypeSelectMask + i),
+                            Avx2.CompareGreaterThan(
+                                Avx2.LoadVector256(pPropertyTypeValues + i).AsSByte(),
+                                propertyTypeFilterVector
+                            ).AsByte()
+                        );
+                        Avx2.Store(pPropertyTypeSelectMask + i, resultVector);
+                    }
+                }
+                for (var i = propertyTypeFilterVectorLimit; i < recordCount; i++)
+                {
+                    var predicateResult = propertyTypeValues[i] == propertyTypeFilter;
+                    propertyTypeSelectMask[i] |= Unsafe.As<bool, byte>(ref predicateResult);
+                    //byteSelectMask[i] = tenureValues[i] == tenureFilter ? -1 : 0;
+                }
+                //for (var i = 0; i < recordCount; i++)
+                //{
+                //    selectMask[i] = selectMask[i] && propertyTypeFilter.Contains(propertyTypeValues[i]);
+                //}
+            }
+
+            fixed (byte* pByteSelectMask = byteSelectMask, pPropertyTypeSelectMask = propertyTypeSelectMask)
+            {
+                for (var i = 0; i < propertyTypeFilterVectorLimit; i += Vector256<byte>.Count)
+                {
+                    var resultVector = Avx2.And(
+                        Avx2.LoadVector256(pByteSelectMask + i),
+                        Avx2.LoadVector256(pPropertyTypeSelectMask + i)
+                    );
+                    Avx2.Store(pByteSelectMask + i, resultVector);
+                }
+            }
+            for (var i = propertyTypeFilterVectorLimit; i < recordCount; i++)
+            {
+                byteSelectMask[i] &= propertyTypeSelectMask[i];
+            }
+
+            var tenureFilter = stringEncoding.GetBytes("F")[0];
+            var tenureFilterVector = Vector256.Create(tenureFilter).AsSByte();
+            var tenureFilterVectorLimit = recordCount - (recordCount % Vector256<byte>.Count);
+            var tenureValues = (recordBatch.Column(3) as StringArray).Values;
+            fixed (byte* pByteSelectMask = byteSelectMask, pTenureValues = tenureValues)
+            {
+                for (var i = 0; i < tenureFilterVectorLimit; i += Vector256<byte>.Count)
+                {
+                    var resultVector = Avx2.And(
+                        Avx2.LoadVector256(pByteSelectMask + i),
+                        Avx2.CompareGreaterThan(
+                            Avx2.LoadVector256(pTenureValues + i).AsSByte(),
+                            tenureFilterVector
+                        ).AsByte()
+                    );
+                    Avx2.Store(pByteSelectMask + i, resultVector);
+                }
+            }
+            for (var i = tenureFilterVectorLimit; i < recordCount; i++)
+            {
+                var predicateResult = tenureValues[i] == tenureFilter;
+                byteSelectMask[i] &= Unsafe.As<bool, byte>(ref predicateResult);
+                //byteSelectMask[i] = byteSelectMask[i] && tenureValues[i] == tenureFilter ? -1 : 0;
+            }
+
+            var countVector = Vector256<byte>.Zero;
+            var oneVector = Vector256.Create((byte)1);
+            fixed (byte* pByteSelectMask = byteSelectMask, pTenureValues = tenureValues)
+            {
+                for (var i = 0; i < tenureFilterVectorLimit; i += Vector256<byte>.Count)
+                {
+                    countVector = Avx2.Add(
+                        countVector,
+                        Avx2.And(Avx2.LoadVector256(pByteSelectMask + i), oneVector)
+                    );
+                }
+            }
+            var count = 0;
+            for (var i = 0; i < Vector256<byte>.Count; i++)
+            {
+                count += countVector.GetElement(i);
+            }
+            for (var i = tenureFilterVectorLimit; i < recordCount; i++)
+            {
+                count += byteSelectMask[i] & 1;
+            }
+#if LOG
+            Console.WriteLine("Found {0} records", count);
+#endif
+            return count;
+            //return selectMask.Count(v => v == -1);
+        }
+
         [Benchmark]
         public int FilterLandRegistryRecordsArrowVectorized2()
         {
-            //var recordCount = recordBatch.Length;
+            var recordCount = recordBatch.Length;
             //var selectMask = new byte[recordCount]; // new int[0];
+            int[] selectMask = new int[recordCount];
             const long MillisecondsPerDay = 86400000;
             var dateFilter = (int)(DateTimeOffset.Parse("2019-01-01").ToUnixTimeMilliseconds() / MillisecondsPerDay);
             var dateValues = (recordBatch.Column(0) as Date32Array).Values;
-            int[] selectMask = VectorizedFiltering.GetFilterMask<int, int>(
-                dateValues, Vector.GreaterThanOrEqual, (v, f) => v >= f, dateFilter);
+            VectorizedFiltering.ApplyFilterMask<int, int>(
+                dateValues, Vector.GreaterThanOrEqual, (v, f) => v >= f, dateFilter,
+                selectMask, Vector.BitwiseOr, (f1, f2) => (byte)(f1 | f2));
 
             var priceValues = (recordBatch.Column(1) as FloatArray).Values;
-            int[] selectMask2 = VectorizedFiltering.GetFilterMask<float, int>(
-                priceValues, Vector.GreaterThan, (v, f) => v > f, 5000000);
-            selectMask = VectorizedFiltering.CombineFilterMask(
-                selectMask, selectMask2, Vector.BitwiseAnd, (f1, f2) => f1 & f2);
+            VectorizedFiltering.ApplyFilterMask<float, int>(
+                priceValues, Vector.GreaterThan, (v, f) => v > f, 5000000,
+                selectMask, Vector.BitwiseAnd, (f1, f2) => f1 & f2);
 
             byte[] byteSelectMask = VectorizedFiltering.NarrowFilterMask(selectMask);
             var stringEncoding = Encoding.ASCII;
@@ -311,10 +470,9 @@ namespace ArrowBenchmark
 
             var tenureFilter = stringEncoding.GetBytes("F")[0];
             var tenureValues = (recordBatch.Column(3) as StringArray).Values;
-            byteSelectMask2 = VectorizedFiltering.GetFilterMask<byte, byte>(
-                tenureValues, Vector.Equals, (v, f) => v == f, tenureFilter);
-            byteSelectMask = VectorizedFiltering.CombineFilterMask(
-                byteSelectMask, byteSelectMask2, Vector.BitwiseAnd, (f1, f2) => (byte)(f1 & f2));
+            VectorizedFiltering.ApplyFilterMask<byte, byte>(
+                tenureValues, Vector.Equals, (v, f) => v == f, tenureFilter,
+                byteSelectMask, Vector.BitwiseAnd, (f1, f2) => (byte)(f1 & f2));
 
             var count = VectorizedFiltering.CountFilterMask(byteSelectMask);
 
@@ -329,6 +487,9 @@ namespace ArrowBenchmark
     {
         static void Main(string[] args)
         {
+            var one = Vector256.Create((short)1);
+            var sum = Avx2.HorizontalAdd(one, one);
+            var sumS = Avx2.HorizontalAdd(one, one);
             //var filterBenchmark = new FilterBenchmark();
             //filterBenchmark.BenchmarkSetup();
             //int itemCount = filterBenchmark.FilterLandRegistryRecordsArrowVectorized2();
@@ -399,33 +560,39 @@ namespace ArrowBenchmark
             T[] filterValues
         ) where T : struct
         {
-            byte[] filterMask = GetFilterMask<T, byte>(values, vectorOp, filterOp, filterValues[0]);
-
-            for (var i = 1; i < filterValues.Length; i++)
+            byte[] filterMask = new byte[values.Length];
+            for (var i = 0; i < filterValues.Length; i++)
             {
-                byte[] filterMask2 = GetFilterMask<T, byte>(values, vectorOp, filterOp, filterValues[i]);
-                filterMask = VectorizedFiltering.CombineFilterMask(
-                    filterMask, filterMask2, Vector.BitwiseOr, (f1, f2) => (byte)(f1 | f2));
+                ApplyFilterMask<T, byte>(
+                    values, vectorOp, filterOp, filterValues[i], 
+                    filterMask, Vector.BitwiseOr, (f1, f2) => (byte)(f1 | f2)
+                );
             }
             return filterMask;
         }
 
-        public static M[] GetFilterMask<T, M>(
+        public static void ApplyFilterMask<T, M>(
             ReadOnlySpan<T> values,
             Func<Vector<T>, Vector<T>, Vector<M>> vectorOp,
             Func<T, T, bool> filterOp,
-            T filterValue
+            T filterValue,
+            M[] filterMask,
+            Func<Vector<M>, Vector<M>, Vector<M>> combineVectorOp,
+            Func<M, M, M> combineItemOp
         ) where T : struct where M : unmanaged
         {
-            var recordCount = values.Length;
-            var filterMask = new M[recordCount];
-            var lastVectorIndex = recordCount - (recordCount % Vector<T>.Count);
+            var recordCount = filterMask.Length;
+            var vectorSize = Vector<T>.Count;
+            var lastVectorIndex = recordCount - (recordCount % vectorSize);
             var filterVector = new Vector<T>(filterValue);
-            for (int i = 0; i < lastVectorIndex; i += Vector<T>.Count)
+            for (int i = 0; i < lastVectorIndex; i += vectorSize)
             {
-                vectorOp(
-                    new Vector<T>(values.Slice(i)),
-                    filterVector
+                combineVectorOp(
+                    new Vector<M>(filterMask, i),
+                    vectorOp(
+                        new Vector<T>(values.Slice(i)),
+                        filterVector
+                    )
                 ).CopyTo(filterMask, i);
             }
             //var zeroValue = default(M);
@@ -434,11 +601,9 @@ namespace ArrowBenchmark
             for (var i = lastVectorIndex; i < recordCount; i++)
             {
                 var predicateResult = filterOp(values[i], filterValue);
-                filterMask[i] = Unsafe.As<bool, M>(ref predicateResult);
+                filterMask[i] = combineItemOp(filterMask[i], Unsafe.As<bool, M>(ref predicateResult));
                 //filterMask[i] = filterOp(values[i], filterValue) ? oneValue : zeroValue;
             }
-
-            return filterMask;
         }
 
         public static byte[] NarrowFilterMask(int[] filterMask)
