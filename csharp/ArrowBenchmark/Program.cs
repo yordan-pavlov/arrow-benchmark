@@ -21,6 +21,8 @@ using System.Text;
 
 namespace ArrowBenchmark
 {
+    // to run this benchmark, navigate up to the csharp directory and execute command:
+    // dotnet run -p ArrowBenchmark -c Release
     [SimpleJob(launchCount: 1, invocationCount: 1, warmupCount: 5, targetCount: 20)]
     public class FilterBenchmark
     {
@@ -30,8 +32,8 @@ namespace ArrowBenchmark
         [GlobalSetup]
         public void BenchmarkSetup()
         {
-            // load csv file into list of objects
-            string landRegistryDataPath = "\\\\nas.local\\Download\\pp-monthly-update-new-version.csv";
+            // load csv file into list of objects 
+            string landRegistryDataPath = string.Concat(Enumerable.Repeat("..\\", 9)) + "data\\pp-monthly-update-new-version.csv";
             
             Console.WriteLine("Loading land registry data");
             var dataLoadTime = Stopwatch.StartNew();
@@ -487,9 +489,14 @@ namespace ArrowBenchmark
     {
         static void Main(string[] args)
         {
-            var one = Vector256.Create((short)1);
-            var sum = Avx2.HorizontalAdd(one, one);
-            var sumS = Avx2.HorizontalAdd(one, one);
+            // counting of items selected in a filter mask could be done using vector operations
+            // by dividing the elements of the orginal vector into two vectors and then adding
+            // and doing this until a single element remains containing the count:
+            //var one = Vector256.Create((byte)1);
+            //var firstHalf = Avx2.ExtractVector128(one, 0);
+            //var secondHalf = Avx2.ExtractVector128(one, (byte)(Vector256<byte>.Count / 2));
+            //Avx.Add(firstHalf, secondHalf);
+
             //var filterBenchmark = new FilterBenchmark();
             //filterBenchmark.BenchmarkSetup();
             //int itemCount = filterBenchmark.FilterLandRegistryRecordsArrowVectorized2();
