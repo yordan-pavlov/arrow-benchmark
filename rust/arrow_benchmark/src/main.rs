@@ -330,10 +330,13 @@ impl LandRegistryRecord {
     // }
 }
 
+use std::path::Path;
+
 fn load_land_registry_data() -> Vec<LandRegistryRecord> {
-    let data_path = "\\\\nas.local\\Download\\pp-monthly-update-new-version.csv";
-    // "\\\\nas.local\\Download\\pp-complete.csv"
-    println!("Loading land registry data");
+    // let path = env::current_dir().unwrap();
+    // println!("The current directory is {}", path.display());
+    let data_path = "..\\..\\data\\pp-monthly-update-new-version.csv";
+    println!("Loading land registry data from: {}", Path::new(data_path).canonicalize().unwrap().display());
     let timer_start = Instant::now();
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
